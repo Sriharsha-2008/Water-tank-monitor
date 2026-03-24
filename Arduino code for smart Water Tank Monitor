@@ -1,0 +1,210 @@
+#define BLYNK_TEMPLATE_ID   "TMPL3RZEXiLr9"
+#define BLYNK_TEMPLATE_NAME "Smart Water Monitoring System"
+#define BLYNK_AUTH_TOKEN    "vnDjjz0-xGIW68ulGxtsik70q2LkUk_U"
+#define BLYNK_PRINT         Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "realme GT 6";
+char pass[] = "srinikh1908";
+
+
+//Declaring names to pins
+#define TRIG_PIN   13
+#define ECHO_PIN   14
+#define RELAY_PIN  16
+
+//Declaring required variables
+const float TANK_HEIGHT_CM = 19.0;
+const int LOW_THRESHOLD = 20;
+const int HIGH_THRESHOLD = 80;
+const int LOW_RESET_AT = 30;
+const int HIGH_RESET_AT = 70;
+
+const long PULSE_TIMEOUT_US = 25000;
+
+int levelPercent = 0;
+bool pumpState = false;
+bool autoMode = true;
+bool lowSent = false;
+bool fullSent = false;
+
+
+//For the manual control
+bool manualOverrideON = false;
+bool manualOverrideOFF = false;
+
+BlynkTimer timer;
+
+void setMotor(bool on) {
+  if (pumpState == on) return;
+
+  pumpState = on;
+  digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+
+  Serial.println(on ? "Motor ON" : "Motor OFF");
+
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V3, on ? 1 : 0);//V3:Motor status LED Datastream
+    Blynk.virtualWrite(V4, on ? 1 : 0);//Manual motor control switch
+  }
+}
+
+float measureDistance() {//Main function to measure the distance of water surface from the sensor
+  float sum = 0.0;
+  int count = 0;
+
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(TRIG_PIN, HIGH);//Send the ultrasonic waves onto the water surface
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH, PULSE_TIMEOUT_US);//Calcuate the time taken
+
+    if (duration == 0) {
+      delay(50);
+      continue;
+    }
+
+    float distance = duration * 0.034 / 2.0;//Calculate the distance using speed of wave and duration
+
+    if (distance >= 2.0 && distance <= TANK_HEIGHT_CM + 5.0) {
+      sum += distance;
+      count++;
+    }
+
+    delay(50);
+  }
+
+  if (count == 0) return -1.0;
+
+  return sum / count;//take the average of the distances
+}
+
+BLYNK_CONNECTED() {//Function to check the connections with blynk cloud
+  Blynk.syncVirtual(V4);
+  Blynk.syncVirtual(V5);//Automatic mode switch
+  Blynk.virtualWrite(V3, pumpState ? 1 : 0);
+}
+
+BLYNK_WRITE(V4) {//Manual switch working logic
+  bool state = param.asInt();//Get data from blynk(whether the manual switch is on or off)
+
+  if (state) {//If manual switch is on, motor is turned on
+    manualOverrideON = true;
+    manualOverrideOFF = false;
+    setMotor(true);
+    Serial.println("Manual ON");
+  } else {//o else it is turned off
+    manualOverrideON = false;
+    manualOverrideOFF = true;
+    setMotor(false);
+    Serial.println("Manual OFF");
+  }
+}
+
+BLYNK_WRITE(V5) {
+  autoMode = param.asInt();
+
+  Serial.println(autoMode ? "Mode: AUTO" : "Mode: MANUAL");
+
+  if (autoMode) {//if the auto mode is on,no manual override
+    manualOverrideON = false;
+    manualOverrideOFF = false;
+  }
+}
+
+void tankLogic() {
+  float distance = measureDistance();
+
+  if (distance < 0) {
+    Serial.println("Sensor error");
+    if (!Blynk.connected()) setMotor(false);
+    return;
+  }
+
+  if (distance > TANK_HEIGHT_CM) distance = TANK_HEIGHT_CM;
+
+  levelPercent = ((TANK_HEIGHT_CM - distance) / TANK_HEIGHT_CM) * 100;//calculate the level percent
+  levelPercent = constrain(levelPercent, 0, 100);
+
+  Serial.print("Level: ");
+  Serial.print(levelPercent);
+  Serial.println("%");
+
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V1, levelPercent);//send the level percent data to blynk datastream
+  }
+
+  if (levelPercent > LOW_RESET_AT) lowSent = false;//to send notification only once
+  if (levelPercent < HIGH_RESET_AT) fullSent = false;
+
+//Sending notification to the blynk 
+  if (levelPercent <= LOW_THRESHOLD && !lowSent && Blynk.connected()) {
+    Blynk.logEvent("low_water", "Water level is low");
+    lowSent = true;
+    fullSent = false;
+  }
+
+  if (levelPercent >= HIGH_THRESHOLD && !fullSent && Blynk.connected()) {
+    Blynk.logEvent("tank_full", "Tank is full");
+    fullSent = true;
+    lowSent = false;
+  }
+  
+//Manual overriding logic:to check the water level before turning on or off the motor manually
+  if (levelPercent >= HIGH_THRESHOLD && pumpState) {
+    setMotor(false);
+    manualOverrideON = false;
+    manualOverrideOFF = false;
+    return;
+  }
+  if (manualOverrideON) {
+    if (!pumpState) setMotor(true);
+    return;
+  }
+  if (manualOverrideOFF) {
+    if (levelPercent <= LOW_THRESHOLD) {
+      manualOverrideOFF = false;
+    } else {
+      if (pumpState) setMotor(false);
+      return;
+    }
+  }
+
+  if (autoMode) {
+    if (levelPercent <= LOW_THRESHOLD && !pumpState) {
+      setMotor(true);
+    } else if (levelPercent >= HIGH_THRESHOLD && pumpState) {
+      setMotor(false);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+//Declare pins as input and output
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, HIGH);
+
+  WiFi.begin(ssid, pass);
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect(5000);
+
+  timer.setInterval(2000L, tankLogic);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+}
